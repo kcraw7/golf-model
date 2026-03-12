@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import flask; print\\(''flask ok''\\)\")",
+      "Bash(python -c \"import dotenv; print\\(''dotenv ok''\\)\")",
+      "Bash(python -c \"import requests; print\\(''requests ok''\\)\")",
+      "Bash(timeout 10 python -c \":*)",
+      "Bash(python -c \":*)",
+      "mcp__Claude_Preview__preview_start"
+    ]
+  }
+}
