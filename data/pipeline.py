@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.fetchers.espn import get_field, get_stats, get_recent_event_scoring, get_last_year_top_finishers
+from data.fetchers.espn import get_field, get_stats, get_recent_event_scoring, get_last_year_top_finishers, get_event_results
 from data.fetchers.pgatour import get_decompositions
 from data.fetchers import odds as odds_fetcher, weather as weather_fetcher
 from data import model
@@ -116,11 +116,93 @@ def run_refresh(db_path: str) -> dict:
             warnings.append(f"Database write failed: {exc}")
             status = "error"
 
+    # ── Step 9: Backfill past outcomes ───────────────────────────────────────
+    try:
+        backfill_outcomes(db_path, current_event_id=event_id)
+    except Exception as exc:
+        # Never block the main refresh — just log
+        print(f"[pipeline] backfill_outcomes failed (non-fatal): {exc}")
+
     return {
         "status": status,
         "warnings": warnings,
         "refreshed_at": now_iso,
     }
+
+
+def backfill_outcomes(db_path: str, current_event_id: str = "") -> None:
+    """Backfill finish positions and hit/miss outcomes for all past pending picks.
+
+    Skips the current in-progress event (can't score an event still being played).
+    Called automatically at the end of run_refresh(); catches all exceptions internally.
+    """
+    from itertools import groupby
+
+    with queries.get_connection(db_path) as conn:
+        pending_rows = queries.get_pending_outcomes(conn)
+
+    if not pending_rows:
+        print("[pipeline] backfill_outcomes: no pending rows to fill")
+        return
+
+    # Group by event_id
+    pending_rows.sort(key=lambda r: r["event_id"])
+    grouped = {
+        eid: list(rows)
+        for eid, rows in groupby(pending_rows, key=lambda r: r["event_id"])
+    }
+
+    total_updated = 0
+
+    for event_id, rows in grouped.items():
+        # Skip the currently-active event — it's still in progress
+        if event_id == current_event_id:
+            print(f"[pipeline] backfill_outcomes: skipping current event {event_id}")
+            continue
+
+        # Strip the "espn_" prefix to get the raw ESPN ID
+        raw_espn_id = event_id.replace("espn_", "") if event_id.startswith("espn_") else event_id
+
+        # Use week_label from the first row for the date lookup
+        week_label = rows[0].get("week_label", "")
+
+        results_map = get_event_results(raw_espn_id, week_label)
+        if not results_map:
+            print(f"[pipeline] backfill_outcomes: no results for event {event_id} ({week_label})")
+            continue
+
+        updated_count = 0
+        with queries.get_connection(db_path) as conn:
+            for row in rows:
+                player_name = row.get("player_name", "")
+                # Normalise name same way espn.py does
+                import unicodedata
+                import re as _re
+
+                def _norm(name):
+                    if not name:
+                        return ""
+                    nfd = unicodedata.normalize("NFD", name)
+                    a = nfd.encode("ascii", "ignore").decode("ascii")
+                    c = _re.sub(r"[^a-z\s]", "", a.lower()).strip()
+                    return _re.sub(r"\s+", " ", c)
+
+                norm = _norm(player_name)
+                finish = results_map.get(norm)
+
+                if finish is None:
+                    continue  # player not found in results (DNS, WD, etc.)
+
+                outcome_hit = 1 if finish <= 10 else 0
+                queries.update_player_outcome(conn, row["id"], finish, outcome_hit)
+                updated_count += 1
+
+            conn.commit()
+
+        total_updated += updated_count
+        print(f"[pipeline] backfill_outcomes: event {event_id}: updated {updated_count}/{len(rows)} rows")
+
+    print(f"[pipeline] backfill_outcomes: total {total_updated} rows updated across {len(grouped)} events")
 
 
 def get_dashboard_data(db_path: str) -> dict:

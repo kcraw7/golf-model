@@ -516,3 +516,94 @@ def get_last_year_top_finishers(event_name: str, start_date_str: str, top_n: int
     except Exception as exc:
         print(f"[espn] get_last_year_top_finishers: unexpected error: {exc}")
         return []
+
+
+# ── Finish positions for a completed past event ───────────────────────────────
+
+def get_event_results(espn_event_id: str, week_label_str: str) -> dict:
+    """Fetch finish positions for a completed past ESPN event.
+
+    Args:
+        espn_event_id: Raw ESPN event ID (e.g. "401811935"), WITHOUT the "espn_" prefix.
+        week_label_str: The week's start date (YYYY-MM-DD) stored in weekly_results.
+
+    Returns:
+        {norm_player_name: finish_position (int)} for all competitors found.
+        Returns {} on any failure. Never raises.
+    """
+    try:
+        from datetime import datetime
+
+        # Convert week_label to YYYYMMDD for the ESPN dates param
+        try:
+            dt = datetime.strptime(week_label_str[:10], "%Y-%m-%d")
+            date_str = dt.strftime("%Y%m%d")
+        except Exception:
+            date_str = None
+
+        # Try the exact week date first, then ±7 days as fallback
+        offsets_to_try = [0, 7, -7, 14, -14] if date_str else []
+        found_event = None
+
+        for offset in offsets_to_try:
+            check_date = datetime.strptime(date_str, "%Y%m%d") + timedelta(days=offset)
+            fetch_date = check_date.strftime("%Y%m%d")
+
+            try:
+                resp = requests.get(
+                    _SCOREBOARD_URL,
+                    params={"dates": fetch_date},
+                    timeout=_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                print(f"[espn] get_event_results: fetch failed for {fetch_date}: {exc}")
+                continue
+
+            for event in data.get("events") or []:
+                if str(event.get("id") or "") == espn_event_id:
+                    found_event = event
+                    break
+
+            if found_event:
+                break
+
+        if not found_event:
+            print(f"[espn] get_event_results: event {espn_event_id} not found near {week_label_str}")
+            return {}
+
+        # Extract competitors and their finish positions
+        competitors = (
+            found_event.get("competitions") or [{}]
+        )[0].get("competitors") or []
+
+        results: dict[str, int] = {}
+        for c in competitors:
+            athlete = c.get("athlete") or {}
+            player_name = (
+                athlete.get("displayName")
+                or athlete.get("fullName")
+                or ""
+            )
+            if not player_name:
+                continue
+
+            finish = c.get("order")
+            if finish is None:
+                continue
+
+            try:
+                finish_int = int(finish)
+            except (TypeError, ValueError):
+                continue
+
+            norm = _norm_name(player_name)
+            results[norm] = finish_int
+
+        print(f"[espn] get_event_results: event {espn_event_id}: {len(results)} player results")
+        return results
+
+    except Exception as exc:
+        print(f"[espn] get_event_results: unexpected error: {exc}")
+        return {}

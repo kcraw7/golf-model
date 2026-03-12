@@ -439,7 +439,7 @@ async function loadHistory() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const history = await res.json();
 
-    placeholder.remove();
+    if (placeholder) placeholder.remove();
 
     if (!history || history.length === 0) {
       accordion.innerHTML = '<div class="text-muted small">No historical picks recorded yet.</div>';
@@ -447,44 +447,114 @@ async function loadHistory() {
       return;
     }
 
-    // Group by event_id + week_label
+    // ── Group by event_id, sorted most-recent first ──────────────────────────
     const groups = {};
     for (const row of history) {
-      const key = `${row.event_id}_${row.week_label}`;
+      const key = row.event_id || row.week_label;
       if (!groups[key]) {
-        groups[key] = { event_name: row.event_name, week_label: row.week_label, rows: [] };
+        groups[key] = {
+          event_name: row.event_name,
+          week_label: row.week_label,
+          rows: [],
+        };
       }
       groups[key].rows.push(row);
     }
 
-    const panels = Object.entries(groups).map(([key, g], idx) => {
-      const panelId = `hist-panel-${idx}`;
+    // Sort groups newest first by week_label
+    const sortedGroups = Object.values(groups).sort((a, b) => {
+      return (b.week_label || '').localeCompare(a.week_label || '');
+    });
+
+    // ── Overall stats bar ────────────────────────────────────────────────────
+    const allRows = history;
+    const totalWeeks = sortedGroups.length;
+    const totalPicks = allRows.length;
+    const resolvedRows = allRows.filter(r => r.outcome_hit !== null && r.outcome_hit !== undefined);
+    const hits = resolvedRows.filter(r => r.outcome_hit === 1).length;
+    const hitRate = resolvedRows.length > 0
+      ? ((hits / resolvedRows.length) * 100).toFixed(1)
+      : null;
+    const edgeRows = allRows.filter(r => r.edge != null);
+    const avgEdge = edgeRows.length > 0
+      ? edgeRows.reduce((s, r) => s + r.edge, 0) / edgeRows.length
+      : null;
+
+    const statsHtml = `
+      <div class="d-flex flex-wrap gap-3 mb-3 p-3 rounded border small">
+        <div class="text-center">
+          <div class="fw-bold fs-5">${totalWeeks}</div>
+          <div class="text-muted">Weeks</div>
+        </div>
+        <div class="text-center">
+          <div class="fw-bold fs-5">${totalPicks}</div>
+          <div class="text-muted">Total Picks</div>
+        </div>
+        <div class="text-center">
+          <div class="fw-bold fs-5 ${hitRate !== null ? (parseFloat(hitRate) >= 30 ? 'text-success' : 'text-danger') : ''}">${hitRate !== null ? hitRate + '%' : '—'}</div>
+          <div class="text-muted">Hit Rate${resolvedRows.length < totalPicks ? ' <span title="Some results still pending" class=\'text-warning\'>*</span>' : ''}</div>
+        </div>
+        <div class="text-center">
+          <div class="fw-bold fs-5 ${avgEdge !== null ? (avgEdge > 0 ? 'text-success' : 'text-danger') : ''}">${avgEdge !== null ? (avgEdge * 100).toFixed(1) + 'pp' : '—'}</div>
+          <div class="text-muted">Avg Edge</div>
+        </div>
+        ${resolvedRows.length < totalPicks ? '<div class="text-muted fst-italic align-self-end">* Pending results update automatically on refresh.</div>' : ''}
+      </div>`;
+
+    // ── Per-week accordion panels ────────────────────────────────────────────
+    const panels = sortedGroups.map((g, idx) => {
+      const panelId  = `hist-panel-${idx}`;
       const collapseId = `hist-collapse-${idx}`;
+
+      const gResolved = g.rows.filter(r => r.outcome_hit !== null && r.outcome_hit !== undefined);
+      const gHits = gResolved.filter(r => r.outcome_hit === 1).length;
+      const gHitRate = gResolved.length > 0
+        ? ((gHits / gResolved.length) * 100).toFixed(0) + '%'
+        : null;
+
+      // Header summary
+      const summaryParts = [`${g.rows.length} pick${g.rows.length !== 1 ? 's' : ''}`];
+      if (gResolved.length > 0) {
+        summaryParts.push(`${gHits} hit${gHits !== 1 ? 's' : ''} — ${gHitRate}`);
+      } else {
+        summaryParts.push('Pending');
+      }
+      const summary = summaryParts.join(', ');
+
       const tableRows = g.rows.map(r => {
-        const outcome = r.outcome_hit === 1
-          ? '<span class="badge bg-success">✓ Hit</span>'
-          : r.outcome_hit === 0
-            ? '<span class="badge bg-danger">✗ Miss</span>'
-            : '<span class="badge bg-secondary">Pending</span>';
+        let outcomeBadge;
+        if (r.outcome_hit === 1) {
+          outcomeBadge = '<span class="badge bg-success">&#10003; Hit</span>';
+        } else if (r.outcome_hit === 0) {
+          outcomeBadge = '<span class="badge bg-danger">&#10007; Miss</span>';
+        } else {
+          outcomeBadge = '<span class="badge bg-secondary">Pending</span>';
+        }
+
+        const recBadge = buildRecBadge(r.recommendation || '—');
+        const finishDisplay = r.finish_position != null ? `#${r.finish_position}` : '—';
+        const edgeDisplay = r.edge != null ? `${(r.edge * 100).toFixed(1)}pp` : '—';
+
         return `
           <tr>
-            <td>${escHtml(r.player_name || '—')}</td>
-            <td>${escHtml(r.recommendation || '—')}</td>
+            <td class="fw-semibold">${escHtml(r.player_name || '—')}</td>
+            <td>${recBadge}</td>
             <td>${formatProb(r.model_prob)}</td>
             <td>${formatProb(r.market_prob)}</td>
-            <td>${r.edge != null ? (r.edge * 100).toFixed(1) + 'pp' : '—'}</td>
-            <td>${r.finish_position != null ? '#' + r.finish_position : '—'}</td>
-            <td>${outcome}</td>
+            <td class="font-monospace small">${edgeDisplay}</td>
+            <td class="font-monospace">${finishDisplay}</td>
+            <td>${outcomeBadge}</td>
           </tr>`;
       }).join('');
 
       return `
         <div class="accordion-item" id="${panelId}">
           <h2 class="accordion-header">
-            <button class="accordion-button collapsed" type="button"
+            <button class="accordion-button collapsed py-2" type="button"
                     data-bs-toggle="collapse" data-bs-target="#${collapseId}">
-              <strong>${escHtml(g.event_name || 'Tournament')}</strong>
-              <span class="ms-2 text-muted small">${escHtml(g.week_label || '')}</span>
+              <span class="fw-semibold me-2">${escHtml(g.event_name || 'Tournament')}</span>
+              <span class="text-muted small me-2">${escHtml(g.week_label || '')}</span>
+              <span class="text-muted small fst-italic">${escHtml(summary)}</span>
             </button>
           </h2>
           <div id="${collapseId}" class="accordion-collapse collapse">
@@ -510,6 +580,8 @@ async function loadHistory() {
         </div>`;
     }).join('');
 
+    // Insert stats bar before accordion
+    accordion.insertAdjacentHTML('beforebegin', statsHtml);
     accordion.innerHTML = panels;
     HISTORY_LOADED = true;
 

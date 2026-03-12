@@ -66,6 +66,30 @@ def get_weekly_history(conn: sqlite3.Connection) -> list:
     return _rows_to_list(cur.fetchall())
 
 
+def get_pending_outcomes(conn: sqlite3.Connection) -> list:
+    """Return weekly_results rows where outcome_hit is still NULL, ordered by event_id."""
+    cur = conn.execute("""
+        SELECT * FROM weekly_results
+        WHERE outcome_hit IS NULL
+        ORDER BY event_id, id
+    """)
+    return _rows_to_list(cur.fetchall())
+
+
+def update_player_outcome(
+    conn: sqlite3.Connection,
+    row_id: int,
+    finish_position: int,
+    outcome_hit: int,
+) -> None:
+    """Update finish_position and outcome_hit for one weekly_results row."""
+    conn.execute("""
+        UPDATE weekly_results
+        SET finish_position = ?, outcome_hit = ?
+        WHERE id = ?
+    """, (finish_position, outcome_hit, row_id))
+
+
 # ── Write queries ────────────────────────────────────────────────────────────
 
 def replace_tournament(conn: sqlite3.Connection, data: dict) -> None:
