@@ -68,24 +68,159 @@ def _norm_name(name: str) -> str:
 _normalize_name = _norm_name
 
 
+# ── Form and course fit helpers ───────────────────────────────────────────────
+
+def apply_form_scores(players: list[dict], recent_scoring: dict) -> None:
+    """Populate recent_form_sg on each player.
+
+    recent_scoring: {norm_player_name: avg_strokes_per_round over last N events}
+
+    form_delta = season_scoring_avg - recent_avg
+        Positive → player is scoring better lately than season average (hot)
+        Negative → player scoring worse lately (cold)
+    Stored on player dict as recent_form_sg.
+    """
+    for p in players:
+        season_avg = p.get("scoring_avg")
+        norm = _norm_name(p.get("player_name") or "")
+        recent_avg = recent_scoring.get(norm)
+
+        if season_avg is not None and recent_avg is not None:
+            p["recent_form_sg"] = round(season_avg - recent_avg, 4)
+        # else leave as None
+
+
+def build_winner_profile(top_finishers: list[dict], skills: list[dict]) -> dict:
+    """Build a weighted average stat profile from past top finishers.
+
+    top_finishers: [{"player_name": ..., "finish_position": 1}, ...]
+    skills: list of ESPN stat dicts (from espn.get_stats())
+
+    Weights: 1st place = 10, 2nd = 9, ..., 10th = 1.
+
+    Returns:
+        {
+          "scoring_avg": float | None,
+          "gir_pct": float | None,
+          "birdies_per_round": float | None,
+          "putts_per_hole": float | None,
+        }
+    Returns empty dict if fewer than 2 finishers have matching stats.
+    """
+    if not top_finishers or not skills:
+        return {}
+
+    # Index skills by normalised name
+    skills_by_name = {_norm_name(s.get("player_name") or ""): s for s in skills}
+
+    stat_keys = ["scoring_avg", "gir_pct", "birdies_per_round", "putts_per_hole"]
+    weighted_sums: dict[str, float] = {k: 0.0 for k in stat_keys}
+    weight_totals: dict[str, float] = {k: 0.0 for k in stat_keys}
+    matched = 0
+
+    for f in top_finishers:
+        norm = _norm_name(f.get("player_name") or "")
+        skill = skills_by_name.get(norm)
+        if not skill:
+            continue
+
+        pos = f.get("finish_position") or (matched + 1)
+        weight = max(1, 11 - pos)  # 1st=10, 2nd=9, ..., 10th=1
+
+        for k in stat_keys:
+            val = skill.get(k)
+            if val is not None:
+                weighted_sums[k] += val * weight
+                weight_totals[k] += weight
+
+        matched += 1
+
+    if matched < 2:
+        print(f"[model] build_winner_profile: only {matched} finisher(s) matched — skipping course fit")
+        return {}
+
+    profile = {}
+    for k in stat_keys:
+        if weight_totals[k] > 0:
+            profile[k] = weighted_sums[k] / weight_totals[k]
+        else:
+            profile[k] = None
+
+    print(f"[model] build_winner_profile: built from {matched} finishers: {profile}")
+    return profile
+
+
+def apply_course_fit_scores(players: list[dict], winner_profile: dict) -> None:
+    """Populate course_history_sg on each player based on similarity to winner profile.
+
+    Uses the same deviation formula as the main composite but compares each
+    player's stats to the winner profile rather than the field average.
+    Positive = player's stats resemble past winners; negative = poor fit.
+    """
+    if not winner_profile:
+        return
+
+    wp_scoring = winner_profile.get("scoring_avg")
+    wp_gir = winner_profile.get("gir_pct")
+    wp_birdies = winner_profile.get("birdies_per_round")
+    wp_putts = winner_profile.get("putts_per_hole")
+
+    for p in players:
+        scoring_avg = p.get("scoring_avg")
+        gir_pct = p.get("gir_pct")
+        birdies_per_round = p.get("birdies_per_round")
+        putts_per_hole = p.get("putts_per_hole")
+
+        # Positive component = player resembles winner profile for that stat
+        scoring_fit = (
+            -(scoring_avg - wp_scoring)
+            if scoring_avg is not None and wp_scoring is not None
+            else 0.0
+        )
+        gir_fit = (
+            (gir_pct - wp_gir) / 5.0
+            if gir_pct is not None and wp_gir is not None
+            else 0.0
+        )
+        birdie_fit = (
+            birdies_per_round - wp_birdies
+            if birdies_per_round is not None and wp_birdies is not None
+            else 0.0
+        )
+        putt_fit = (
+            -(putts_per_hole - wp_putts)
+            if putts_per_hole is not None and wp_putts is not None
+            else 0.0
+        )
+
+        fit_score = (
+            scoring_fit * 0.45
+            + gir_fit * 0.30
+            + birdie_fit * 0.15
+            + putt_fit * 0.10
+        )
+        p["course_history_sg"] = round(fit_score, 4)
+
+
 # ── ESPN stats → Win probability model ───────────────────────────────────────
 
 def sg_to_win_probs(players: list[dict]) -> list[dict]:
     """Convert ESPN stats into estimated win/top5/top10/top20 probabilities.
 
-    Uses a composite score built from ESPN stats, then applies softmax
-    normalisation across the field with a tuned temperature.
+    Uses a composite score built from ESPN stats plus form and course fit signals,
+    then applies softmax normalisation across the field with a tuned temperature.
 
     Composite score formula (all components are field-deviation-based):
-        scoring_component  = -(scoring_avg - field_avg)   [lower avg = better]
-        gir_component      = (gir_pct - field_avg) / 5.0  [scaled to ~same range]
-        birdie_component   = (birdies_per_round - field_avg)
-        putting_component  = -(putts_per_hole - field_avg) [lower = better]
+        scoring_component    = -(scoring_avg - field_avg)        weight 0.35
+        gir_component        = (gir_pct - field_avg) / 5.0       weight 0.25
+        birdie_component     = (birdies_per_round - field_avg)    weight 0.12
+        putting_component    = -(putts_per_hole - field_avg)      weight 0.08
+        form_component       = (recent_form_sg - field_avg)       weight 0.12
+        course_fit_component = (course_history_sg - field_avg)    weight 0.08
 
-        composite = (scoring * 0.45 + gir * 0.30 + birdie * 0.15 + putting * 0.10)
-
-    Falls back to 0.0 for any missing individual stat. If ALL stats are missing
-    for ALL players, assigns uniform probability.
+    Falls back to 0.0 for any missing individual stat/signal.
+    Weights are redistributed back to base stats when form/fit data unavailable.
+    If ALL stats are missing for ALL players, assigns uniform probability.
 
     Returns:
         The same list with dg_win_prob, dg_top5_prob, dg_top10_prob,
@@ -95,11 +230,13 @@ def sg_to_win_probs(players: list[dict]) -> list[dict]:
     if field_size == 0:
         return players
 
-    # Collect per-stat values, using 0.0 as fallback for missing
+    # Collect per-stat values
     scoring_vals = [p.get("scoring_avg") for p in players]
     gir_vals = [p.get("gir_pct") for p in players]
     birdie_vals = [p.get("birdies_per_round") for p in players]
     putting_vals = [p.get("putts_per_hole") for p in players]
+    form_vals = [p.get("recent_form_sg") for p in players]
+    fit_vals = [p.get("course_history_sg") for p in players]
 
     # Check if we have ANY real stats at all
     has_any_stats = any(
@@ -126,6 +263,21 @@ def sg_to_win_probs(players: list[dict]) -> list[dict]:
     field_avg_gir = _field_avg(gir_vals)
     field_avg_birdies = _field_avg(birdie_vals)
     field_avg_putts = _field_avg(putting_vals)
+    field_avg_form = _field_avg(form_vals)
+    field_avg_fit = _field_avg(fit_vals)
+
+    # Determine effective weights — redistribute to base stats when signals missing
+    has_form = any(v is not None for v in form_vals)
+    has_fit = any(v is not None for v in fit_vals)
+
+    if has_form and has_fit:
+        w_scoring, w_gir, w_birdie, w_putt, w_form, w_fit = 0.35, 0.25, 0.12, 0.08, 0.12, 0.08
+    elif has_form:
+        w_scoring, w_gir, w_birdie, w_putt, w_form, w_fit = 0.39, 0.28, 0.13, 0.08, 0.12, 0.00
+    elif has_fit:
+        w_scoring, w_gir, w_birdie, w_putt, w_form, w_fit = 0.39, 0.28, 0.14, 0.11, 0.00, 0.08
+    else:
+        w_scoring, w_gir, w_birdie, w_putt, w_form, w_fit = 0.45, 0.30, 0.15, 0.10, 0.00, 0.00
 
     scores = []
     for p in players:
@@ -133,6 +285,8 @@ def sg_to_win_probs(players: list[dict]) -> list[dict]:
         gir_pct = p.get("gir_pct")
         birdies_per_round = p.get("birdies_per_round")
         putts_per_hole = p.get("putts_per_hole")
+        recent_form = p.get("recent_form_sg")
+        course_fit = p.get("course_history_sg")
 
         # Lower scoring_avg = better → invert so positive = good
         scoring_component = -(
@@ -150,12 +304,22 @@ def sg_to_win_probs(players: list[dict]) -> list[dict]:
         putting_component = -(
             (putts_per_hole - field_avg_putts) if putts_per_hole is not None else 0.0
         )
+        # Form: positive = trending better vs season avg
+        form_component = (
+            (recent_form - field_avg_form) if recent_form is not None else 0.0
+        )
+        # Course fit: positive = stats resemble past winners at this course
+        fit_component = (
+            (course_fit - field_avg_fit) if course_fit is not None else 0.0
+        )
 
         composite = (
-            scoring_component * 0.45
-            + gir_component * 0.30
-            + birdie_component * 0.15
-            + putting_component * 0.10
+            scoring_component * w_scoring
+            + gir_component * w_gir
+            + birdie_component * w_birdie
+            + putting_component * w_putt
+            + form_component * w_form
+            + fit_component * w_fit
         )
         scores.append(composite)
 
@@ -189,7 +353,8 @@ def generate_blurb(player: dict) -> str:
     """Auto-generate a 1-2 sentence reasoning string for a player.
 
     References ESPN stats: scoring_avg, gir_pct, driving_dist, birdies_per_round,
-    putts_per_hole. Returns a plain-English summary with edge conclusion.
+    putts_per_hole, recent_form_sg, course_history_sg.
+    Returns a plain-English summary with edge conclusion.
     """
     name = player.get("player_name") or "Player"
     last_name = name.split()[-1] if name.split() else name
@@ -201,6 +366,8 @@ def generate_blurb(player: dict) -> str:
     putts_per_hole = player.get("putts_per_hole")
     edge_top10 = player.get("edge_top10")
     rec = player.get("recommendation") or "No Data"
+    recent_form = player.get("recent_form_sg")
+    course_fit = player.get("course_history_sg")
 
     # No data path
     has_any_stat = any(v is not None for v in [
@@ -253,6 +420,20 @@ def generate_blurb(player: dict) -> str:
         elif putts_per_hole > 1.80:
             parts.append(f"putting is a weakness ({putts_per_hole:.2f} putts/hole)")
 
+    # Form signal
+    if recent_form is not None:
+        if recent_form > 0.5:
+            parts.append(f"trending hot (last 3 events averaging {recent_form:.1f} strokes better than season)")
+        elif recent_form < -0.5:
+            parts.append(f"trending cold (last 3 events averaging {abs(recent_form):.1f} strokes worse than season)")
+
+    # Course fit signal
+    if course_fit is not None:
+        if course_fit > 0.3:
+            parts.append("strong course fit based on past winner profiles")
+        elif course_fit < -0.3:
+            parts.append("weak course fit vs past winner profiles")
+
     # Driving distance (context only, not primary)
     if driving_dist is not None and len(parts) == 0:
         parts.append(f"{last_name} averages {driving_dist:.0f} yards off the tee")
@@ -297,19 +478,19 @@ def merge_and_score(
     skills: list,
     decomps: list,
     odds_data: dict,
+    recent_scoring: dict | None = None,
+    winner_profile: dict | None = None,
 ) -> list[dict]:
     """Merge all data sources and return a scored, sorted player list.
 
     Args:
-        field:     Output of espn.get_field() — contains event info and player list.
-        preds:     Unused (kept for API compatibility).
-        skills:    Output of espn.get_stats() — ESPN stats per player, keyed by
-                   athlete_id and player_name.
-        decomps:   Unused (kept for API compatibility).
-        odds_data: Dict keyed by normalised player name from odds fetcher.
-
-    Player IDs from the scoreboard (competitor["id"]) should match
-    athlete["id"] from the stats API, so we index by both id and name.
+        field:          Output of espn.get_field() — event info and player list.
+        preds:          Unused (kept for API compatibility).
+        skills:         Output of espn.get_stats() — ESPN stats per player.
+        decomps:        Unused (kept for API compatibility).
+        odds_data:      Dict keyed by normalised player name from odds fetcher.
+        recent_scoring: {norm_name: avg_strokes/round over last 3 events} or None.
+        winner_profile: Weighted stat profile of past winners at this course or None.
     """
     players_raw = field.get("players", [])
 
@@ -339,12 +520,11 @@ def merge_and_score(
             "player_name": name,
             "country": raw.get("country") or "",
             # ESPN stats — stored in both raw keys (for model) and sg_* keys (for DB/display)
-            # sg_total is not available from ESPN; shown as N/A
-            "sg_total": None,
-            "sg_ott": skill.get("driving_dist"),      # repurposed: driving distance
-            "sg_app": skill.get("gir_pct"),            # repurposed: GIR %
-            "sg_atg": skill.get("birdies_per_round"),  # repurposed: birdies/round
-            "sg_putt": skill.get("putts_per_hole"),    # repurposed: putts/hole
+            "sg_total": skill.get("scoring_avg"),  # repurposed: stores scoring avg for display
+            "sg_ott": skill.get("driving_dist"),      # driving distance
+            "sg_app": skill.get("gir_pct"),            # GIR %
+            "sg_atg": skill.get("birdies_per_round"),  # birdies/round
+            "sg_putt": skill.get("putts_per_hole"),    # putts/hole
             # Raw ESPN stats for model calculation
             "scoring_avg": skill.get("scoring_avg"),
             "gir_pct": skill.get("gir_pct"),
@@ -352,7 +532,7 @@ def merge_and_score(
             "driving_acc": skill.get("driving_acc"),
             "birdies_per_round": skill.get("birdies_per_round"),
             "putts_per_hole": skill.get("putts_per_hole"),
-            # Course/form not available from ESPN
+            # Form and course fit (populated below)
             "course_history_sg": None,
             "course_history_rounds": None,
             "recent_form_sg": None,
@@ -374,7 +554,15 @@ def merge_and_score(
         }
         players.append(player)
 
-    # Generate model probabilities from ESPN stats
+    # ── Apply form scores ────────────────────────────────────────────────────
+    if recent_scoring:
+        apply_form_scores(players, recent_scoring)
+
+    # ── Apply course fit scores ──────────────────────────────────────────────
+    if winner_profile:
+        apply_course_fit_scores(players, winner_profile)
+
+    # Generate model probabilities from ESPN stats + form + course fit
     players = sg_to_win_probs(players)
 
     # ── Merge odds ──────────────────────────────────────────────────────────

@@ -212,14 +212,14 @@ function renderPlayers(players) {
     const rec = p.recommendation || 'No Data';
     const recBadge = buildRecBadge(rec);
 
-    const edgeVal = p.edge_top10;
+    const edgeVal = p.edge_top10 ?? p.edge_win;
+    const edgeLabel = p.edge_top10 != null ? '' : ' title="Win edge (no top10 market)"';
     const edgeDisplay = edgeVal != null
-      ? `<span class="${edgeBadgeClass(rec)} badge">${(edgeVal * 100).toFixed(1)}pp</span>`
+      ? `<span class="${edgeBadgeClass(rec)} badge"${edgeLabel}>${(edgeVal * 100).toFixed(1)}pp</span>`
       : `<span class="badge bg-secondary">—</span>`;
 
-    // Course fit and form are not available from ESPN
-    const courseFit = '<span class="text-muted small">N/A</span>';
-    const formDisplay = '<span class="text-muted small">N/A</span>';
+    const courseFit = formatCourseFit(p.course_history_sg);
+    const formDisplay = formIndicator(p.recent_form_sg);
 
     return `
       <tr class="player-row" id="${rowId}" style="cursor:pointer" onclick="toggleBlurb('${blurbId}', '${rowId}')">
@@ -230,7 +230,7 @@ function renderPlayers(players) {
         <td class="font-monospace small">${formatAmerican(p.odds_win_american)}</td>
         <td class="font-monospace small">${formatAmerican(p.odds_top10_american)}</td>
         <td>${edgeDisplay}</td>
-        <td>${formatScoringAvg(p.scoring_avg)}</td>
+        <td>${formatScoringAvg(p.sg_total)}</td>
         <td>${formatDrivingDist(p.sg_ott)}</td>
         <td>${formatGIR(p.sg_app)}</td>
         <td>${formatBirdies(p.sg_atg)}</td>
@@ -318,9 +318,21 @@ function formatPutts(n) {
 
 function formIndicator(sg) {
   if (sg === null || sg === undefined) return '<span class="text-muted">—</span>';
-  if (sg > 0.2) return '<span class="text-success fw-bold" title="Good form">↑</span>';
-  if (sg < -0.2) return '<span class="text-danger fw-bold" title="Poor form">↓</span>';
-  return '<span class="text-secondary" title="Neutral form">→</span>';
+  if (sg > 0.5) return `<span class="text-success fw-bold" title="Hot: ${sg.toFixed(2)} strokes/rnd better than season">↑ Hot</span>`;
+  if (sg > 0.2) return `<span class="text-success" title="Trending up: ${sg.toFixed(2)} strokes/rnd better than season">↑</span>`;
+  if (sg < -0.5) return `<span class="text-danger fw-bold" title="Cold: ${Math.abs(sg).toFixed(2)} strokes/rnd worse than season">↓ Cold</span>`;
+  if (sg < -0.2) return `<span class="text-danger" title="Trending down: ${Math.abs(sg).toFixed(2)} strokes/rnd worse than season">↓</span>`;
+  return `<span class="text-secondary" title="Neutral form: ${sg.toFixed(2)} vs season avg">→</span>`;
+}
+
+function formatCourseFit(score) {
+  if (score === null || score === undefined) return '<span class="text-muted">—</span>';
+  // score is a deviation from winner profile — positive = good fit
+  if (score > 0.5) return `<span class="text-success fw-bold" title="Strong course fit (${score.toFixed(2)})">A+</span>`;
+  if (score > 0.2) return `<span class="text-success" title="Good course fit (${score.toFixed(2)})">A</span>`;
+  if (score > -0.2) return `<span class="text-secondary" title="Average course fit (${score.toFixed(2)})">B</span>`;
+  if (score > -0.5) return `<span class="text-warning" title="Below-avg course fit (${score.toFixed(2)})">C</span>`;
+  return `<span class="text-danger" title="Poor course fit (${score.toFixed(2)})">D</span>`;
 }
 
 function buildRecBadge(rec) {

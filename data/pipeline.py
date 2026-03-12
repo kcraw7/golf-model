@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.fetchers.espn import get_field, get_stats
+from data.fetchers.espn import get_field, get_stats, get_recent_event_scoring, get_last_year_top_finishers
 from data.fetchers.pgatour import get_decompositions
 from data.fetchers import odds as odds_fetcher, weather as weather_fetcher
 from data import model
@@ -59,8 +59,31 @@ def run_refresh(db_path: str) -> dict:
         warnings.append(f"Weather fetch failed: {exc}")
         forecast = []
 
-    # ── Step 4: Score ───────────────────────────────────────────────────────
-    scored_players = model.merge_and_score(field, preds, skills, decomps, odds_data)
+    # ── Step 4: Form (last 3 events vs season avg) ───────────────────────────
+    try:
+        recent_scoring = get_recent_event_scoring(num_events=3)
+    except Exception as exc:
+        warnings.append(f"Recent form fetch failed: {exc}")
+        recent_scoring = {}
+
+    # ── Step 5: Course fit (last year's top finishers at this tournament) ────
+    winner_profile: dict = {}
+    try:
+        event_name = field.get("event_name") or ""
+        start_date = field.get("start_date") or ""
+        if event_name and start_date:
+            top_finishers = get_last_year_top_finishers(event_name, start_date)
+            if top_finishers:
+                winner_profile = model.build_winner_profile(top_finishers, skills)
+    except Exception as exc:
+        warnings.append(f"Course fit fetch failed: {exc}")
+
+    # ── Step 6: Score ───────────────────────────────────────────────────────
+    scored_players = model.merge_and_score(
+        field, preds, skills, decomps, odds_data,
+        recent_scoring=recent_scoring,
+        winner_profile=winner_profile,
+    )
 
     # ── Step 5: Persist ─────────────────────────────────────────────────────
     event_id = field.get("event_id") or "unknown"
@@ -82,10 +105,10 @@ def run_refresh(db_path: str) -> dict:
             queries.replace_players(conn, scored_players, event_id, now_iso)
             queries.replace_weather(conn, forecast, event_id, now_iso)
 
-            # ── Step 6: Snapshot picks ──────────────────────────────────────
+            # ── Step 7: Snapshot picks ──────────────────────────────────────
             queries.snapshot_weekly_picks(conn, scored_players, field)
 
-            # ── Step 7: Log ─────────────────────────────────────────────────
+            # ── Step 8: Log ─────────────────────────────────────────────────
             queries.log_refresh(conn, status, warnings, odds_fetcher.CREDITS_REMAINING)
 
             conn.commit()

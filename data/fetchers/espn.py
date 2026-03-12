@@ -3,6 +3,9 @@
 No API key required. Endpoints are undocumented and may change.
 All functions return empty/default data on failure — they never raise.
 """
+import re
+import unicodedata
+from datetime import date, timedelta
 import requests
 
 _SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/golf/pga/scoreboard"
@@ -279,4 +282,237 @@ def get_stats() -> list[dict]:
 
     except Exception as exc:
         print(f"[espn] get_stats: parse error: {exc}")
+        return []
+
+
+# ── Name normalisation (mirrors model._norm_name) ────────────────────────────
+
+def _norm_name(name: str) -> str:
+    if not name:
+        return ""
+    nfd = unicodedata.normalize("NFD", name)
+    ascii_name = nfd.encode("ascii", "ignore").decode("ascii")
+    lower = ascii_name.lower()
+    clean = re.sub(r"[^a-z\s]", "", lower).strip()
+    return re.sub(r"\s+", " ", clean)
+
+
+# ── Recent event scoring (last N completed events) ───────────────────────────
+
+def get_recent_event_scoring(num_events: int = 3) -> dict:
+    """Return per-player scoring averages from the last N completed PGA events.
+
+    Steps back in 7-day increments from last week, collecting completed events.
+    Returns:
+        {
+          "rory mcilroy": 69.0,   # avg strokes/round across last N events
+          ...
+        }
+    Returns empty dict on total failure. Never raises.
+    """
+    try:
+        seen_event_ids: set = set()
+        # {norm_name: [round_stroke_values]}
+        strokes_by_player: dict[str, list[float]] = {}
+
+        start_date = date.today() - timedelta(days=7)  # start from last week
+
+        for week_offset in range(10):  # max 10 weeks back to avoid infinite loop
+            if len(seen_event_ids) >= num_events:
+                break
+
+            check_date = start_date - timedelta(weeks=week_offset)
+            date_str = check_date.strftime("%Y%m%d")
+
+            try:
+                resp = requests.get(
+                    _SCOREBOARD_URL,
+                    params={"dates": date_str},
+                    timeout=_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                print(f"[espn] get_recent_event_scoring: fetch failed for {date_str}: {exc}")
+                continue
+
+            events = data.get("events") or []
+            for event in events:
+                event_id = str(event.get("id") or "")
+                if not event_id or event_id in seen_event_ids:
+                    continue
+
+                # Only process completed events
+                status_name = (
+                    event.get("status", {}).get("type", {}).get("name", "")
+                )
+                if status_name != "STATUS_FINAL":
+                    continue
+
+                # Only PGA Tour events (not opposite-field or Korn Ferry)
+                tour = event.get("tour", {})
+                if isinstance(tour, dict):
+                    tour_slug = tour.get("slug", "") or ""
+                    if tour_slug and "pga" not in tour_slug.lower():
+                        continue
+
+                seen_event_ids.add(event_id)
+                if len(seen_event_ids) > num_events:
+                    break
+
+                competitors = (
+                    event.get("competitions") or [{}]
+                )[0].get("competitors") or []
+
+                for c in competitors:
+                    athlete = c.get("athlete") or {}
+                    player_name = (
+                        athlete.get("displayName")
+                        or athlete.get("fullName")
+                        or ""
+                    )
+                    if not player_name:
+                        continue
+
+                    norm = _norm_name(player_name)
+
+                    # Sum per-round strokes from linescores
+                    # Filter: period 1-4 (not playoff) and value > 50 (valid round)
+                    round_strokes = [
+                        ls["value"]
+                        for ls in (c.get("linescores") or [])
+                        if ls.get("period", 0) in (1, 2, 3, 4)
+                        and ls.get("value", 0) > 50
+                    ]
+                    if not round_strokes:
+                        continue
+
+                    strokes_by_player.setdefault(norm, []).extend(round_strokes)
+
+        # Convert accumulated strokes to per-round averages
+        result: dict[str, float] = {}
+        for norm, strokes in strokes_by_player.items():
+            if strokes:
+                result[norm] = sum(strokes) / len(strokes)
+
+        print(f"[espn] get_recent_event_scoring: {len(seen_event_ids)} events, {len(result)} players")
+        return result
+
+    except Exception as exc:
+        print(f"[espn] get_recent_event_scoring: unexpected error: {exc}")
+        return {}
+
+
+# ── Last year's top finishers at the same tournament ─────────────────────────
+
+def get_last_year_top_finishers(event_name: str, start_date_str: str, top_n: int = 10) -> list:
+    """Find the same tournament from ~1 year ago and return its top N finishers.
+
+    Searches ±7 days of (start_date - 364 days) for an event whose name
+    fuzzy-matches the current tournament name.
+
+    Returns:
+        [
+          {"player_name": "Rory McIlroy", "finish_position": 1},
+          ...
+        ]
+    Returns empty list if the event can't be found or matched. Never raises.
+    """
+    try:
+        if not start_date_str:
+            print("[espn] get_last_year_top_finishers: no start_date provided")
+            return []
+
+        # Parse start date
+        try:
+            from datetime import datetime
+            start_dt = datetime.strptime(start_date_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            print(f"[espn] get_last_year_top_finishers: bad start_date: {start_date_str}")
+            return []
+
+        target_date = start_dt - timedelta(days=364)
+
+        # Normalise event name for fuzzy matching: keep significant words only
+        def _sig_words(name: str) -> set:
+            stop = {"the", "a", "an", "in", "at", "by", "pres", "presented", "presented by"}
+            return {
+                w.lower()
+                for w in re.findall(r"[a-zA-Z]+", name)
+                if w.lower() not in stop and len(w) > 2
+            }
+
+        current_words = _sig_words(event_name)
+        if not current_words:
+            print("[espn] get_last_year_top_finishers: no significant words in event name")
+            return []
+
+        # Search ±7 days around target date
+        best_event = None
+        best_overlap = 0
+
+        for day_offset in [0, -7, 7, -14, 14]:
+            check_date = target_date + timedelta(days=day_offset)
+            date_str = check_date.strftime("%Y%m%d")
+
+            try:
+                resp = requests.get(
+                    _SCOREBOARD_URL,
+                    params={"dates": date_str},
+                    timeout=_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                print(f"[espn] get_last_year_top_finishers: fetch failed for {date_str}: {exc}")
+                continue
+
+            for event in data.get("events") or []:
+                status_name = (
+                    event.get("status", {}).get("type", {}).get("name", "")
+                )
+                if status_name != "STATUS_FINAL":
+                    continue
+
+                candidate_name = event.get("name") or ""
+                overlap = len(current_words & _sig_words(candidate_name))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_event = event
+
+            if best_overlap >= max(2, len(current_words) // 2):
+                break  # good enough match found
+
+        if best_event is None or best_overlap < 2:
+            print(f"[espn] get_last_year_top_finishers: no match found for '{event_name}' (best overlap={best_overlap})")
+            return []
+
+        print(f"[espn] get_last_year_top_finishers: matched '{best_event.get('name')}' (overlap={best_overlap})")
+
+        competitors = (
+            best_event.get("competitions") or [{}]
+        )[0].get("competitors") or []
+
+        # Sort by finish order (1 = winner) and return top N
+        sorted_comps = sorted(competitors, key=lambda c: c.get("order", 9999))
+        result = []
+        for c in sorted_comps[:top_n]:
+            athlete = c.get("athlete") or {}
+            player_name = (
+                athlete.get("displayName")
+                or athlete.get("fullName")
+                or ""
+            )
+            if not player_name:
+                continue
+            result.append({
+                "player_name": player_name,
+                "finish_position": c.get("order", len(result) + 1),
+            })
+
+        print(f"[espn] get_last_year_top_finishers: {len(result)} finishers found")
+        return result
+
+    except Exception as exc:
+        print(f"[espn] get_last_year_top_finishers: unexpected error: {exc}")
         return []

@@ -25,11 +25,8 @@
   transition: background-color 0.15s ease;
 }
 
-/* Sticky table header */
+/* Table header — background ensures rows don't show through on scroll */
 .table-header-sticky th {
-  position: sticky;
-  top: 56px; /* approx navbar height */
-  z-index: 2;
   background-color: var(--bs-body-bg);
 }
 
