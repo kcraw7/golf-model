@@ -161,10 +161,18 @@ def get_field() -> dict:
                 or ""
             )
 
+            # Current leaderboard position (1 = leader; None if not yet posted)
+            raw_order = c.get("order")
+            try:
+                current_position = int(raw_order) if raw_order is not None else None
+            except (TypeError, ValueError):
+                current_position = None
+
             players.append({
                 "dg_id": pid,
                 "player_name": player_name,
                 "country": country,
+                "current_position": current_position,
             })
 
         return {

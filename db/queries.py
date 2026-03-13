@@ -224,6 +224,7 @@ def replace_players(
                 course_history_sg, course_history_rounds, recent_form_sg,
                 edge_win, edge_top10,
                 recommendation, blurb,
+                current_position,
                 event_id, fetched_at
             ) VALUES (
                 :dg_id, :player_name, :country,
@@ -234,6 +235,7 @@ def replace_players(
                 :course_history_sg, :course_history_rounds, :recent_form_sg,
                 :edge_win, :edge_top10,
                 :recommendation, :blurb,
+                :current_position,
                 :event_id, :fetched_at
             )
         """, p_copy)

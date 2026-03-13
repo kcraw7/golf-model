@@ -82,10 +82,18 @@
     <!-- Sort -->
     <div class="col-12 col-md-3">
       <select class="form-select form-select-sm" id="sortSelect" onchange="applyFilters()">
-        <option value="edge_top10">Edge (Default)</option>
-        <option value="dg_win_prob">Win Prob</option>
-        <option value="sg_total">Score Avg</option>
-        <option value="player_name">Player Name</option>
+        <option value="edge_top10">Sort: Edge (Default)</option>
+        <option value="current_position">Sort: Position</option>
+        <option value="dg_win_prob">Sort: Win Prob</option>
+        <option value="dg_top10_prob">Sort: Top 10%</option>
+        <option value="sg_total">Sort: Score Avg</option>
+        <option value="sg_ott">Sort: Drive Yds</option>
+        <option value="sg_app">Sort: GIR %</option>
+        <option value="sg_atg">Sort: Birdies/Rnd</option>
+        <option value="sg_putt">Sort: Putts/Hole</option>
+        <option value="course_history_sg">Sort: Course Fit</option>
+        <option value="recent_form_sg">Sort: Form</option>
+        <option value="player_name">Sort: Player Name</option>
       </select>
     </div>
   </div>
@@ -96,6 +104,7 @@
       <table class="table table-sm table-hover align-middle golf-table" id="playerTable">
         <thead class="table-header-sticky">
           <tr>
+            <th data-sort-key="current_position" data-sort-numeric title="Current leaderboard position in this week's tournament">Pos</th>
             <th data-sort-key="player_name">Player</th>
             <th data-sort-key="country">Country</th>
             <th data-sort-key="dg_win_prob" data-sort-numeric data-sort-desc title="Model Win Probability">Win%</th>
@@ -115,7 +124,7 @@
           </tr>
         </thead>
         <tbody id="playerTableBody">
-          <tr><td colspan="16" class="text-center text-muted py-4">Loading players…</td></tr>
+          <tr><td colspan="17" class="text-center text-muted py-4">Loading players…</td></tr>
         </tbody>
       </table>
     </div>

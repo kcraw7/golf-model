@@ -519,6 +519,7 @@ def merge_and_score(
             "dg_id": pid,
             "player_name": name,
             "country": raw.get("country") or "",
+            "current_position": raw.get("current_position"),
             # ESPN stats — stored in both raw keys (for model) and sg_* keys (for DB/display)
             "sg_total": skill.get("scoring_avg"),  # repurposed: stores scoring avg for display
             "sg_ott": skill.get("driving_dist"),      # driving distance

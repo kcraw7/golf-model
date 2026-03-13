@@ -155,7 +155,8 @@ function applyFilters() {
   const sel = document.getElementById('sortSelect');
   if (sel && sel.value && sel.value !== PLAYER_SORT.key) {
     PLAYER_SORT.key = sel.value;
-    PLAYER_SORT.asc = false; // default desc for dropdown changes
+    // Position and player name sort ascending; everything else descending
+    PLAYER_SORT.asc = (sel.value === 'current_position' || sel.value === 'player_name');
   }
   const filter = CURRENT_FILTER;
 
@@ -235,7 +236,7 @@ function renderPlayers(players) {
 
   if (!players || players.length === 0) {
     tbody.innerHTML = `
-      <tr><td colspan="16" class="text-center text-muted py-5">
+      <tr><td colspan="17" class="text-center text-muted py-5">
         No players found — try adjusting filters or click <strong>Refresh Data</strong>.
       </td></tr>`;
     return;
@@ -257,8 +258,13 @@ function renderPlayers(players) {
     const courseFit = formatCourseFit(p.course_history_sg);
     const formDisplay = formIndicator(p.recent_form_sg);
 
+    const posDisplay = p.current_position != null
+      ? `<span class="font-monospace small fw-semibold">${p.current_position}</span>`
+      : `<span class="text-muted">—</span>`;
+
     return `
       <tr class="player-row" id="${rowId}" style="cursor:pointer" onclick="toggleBlurb('${blurbId}', '${rowId}')">
+        <td class="text-center">${posDisplay}</td>
         <td class="fw-semibold">${escHtml(p.player_name || '—')}</td>
         <td><span class="text-muted small">${escHtml(p.country || '—')}</span></td>
         <td>${formatProb(p.dg_win_prob)}</td>
@@ -277,7 +283,7 @@ function renderPlayers(players) {
         <td><span class="expander-icon small text-muted">▶</span></td>
       </tr>
       <tr class="blurb-row d-none" id="${blurbId}">
-        <td colspan="16">
+        <td colspan="17">
           <div class="blurb-content px-2 py-2 text-muted fst-italic small">
             ${escHtml(p.blurb || 'No analysis available.')}
           </div>

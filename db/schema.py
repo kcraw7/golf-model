@@ -44,6 +44,7 @@ def init_db(db_path: str) -> None:
             edge_top10           REAL,
             recommendation       TEXT,
             blurb                TEXT,
+            current_position     INTEGER,
             event_id             TEXT,
             fetched_at           TEXT
         );
