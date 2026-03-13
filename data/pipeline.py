@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.fetchers.espn import get_field, get_stats, get_recent_event_scoring, get_last_year_top_finishers, get_event_results
+from data.fetchers.espn import get_field, get_stats, get_recent_event_scoring, get_last_year_top_finishers, get_event_results, get_season_events
 from data.fetchers.pgatour import get_decompositions
 from data.fetchers import odds as odds_fetcher, weather as weather_fetcher
 from data import model
@@ -120,8 +120,13 @@ def run_refresh(db_path: str) -> dict:
     try:
         backfill_outcomes(db_path, current_event_id=event_id)
     except Exception as exc:
-        # Never block the main refresh — just log
         print(f"[pipeline] backfill_outcomes failed (non-fatal): {exc}")
+
+    # ── Step 10: Season backfill (retroactive model runs) ────────────────────
+    try:
+        backfill_season(db_path, current_event_id=event_id)
+    except Exception as exc:
+        print(f"[pipeline] backfill_season failed (non-fatal): {exc}")
 
     return {
         "status": status,
@@ -203,6 +208,147 @@ def backfill_outcomes(db_path: str, current_event_id: str = "") -> None:
         print(f"[pipeline] backfill_outcomes: event {event_id}: updated {updated_count}/{len(rows)} rows")
 
     print(f"[pipeline] backfill_outcomes: total {total_updated} rows updated across {len(grouped)} events")
+
+
+def backfill_season(db_path: str, current_event_id: str = "") -> None:
+    """Retroactively score all completed PGA Tour events this season.
+
+    For each past event not already in tournament_results:
+    - Matches field players to current season stats
+    - Runs sg_to_win_probs() to rank players by model win probability
+    - Saves full field to tournament_results
+    - Saves top-20 picks to weekly_results with recommendation='Model Pick'
+
+    Called automatically at end of run_refresh(); never raises.
+    """
+    import unicodedata as _ud
+    import re as _re
+    from datetime import datetime as _dt
+
+    def _norm(name):
+        if not name:
+            return ""
+        nfd = _ud.normalize("NFD", name)
+        a = nfd.encode("ascii", "ignore").decode("ascii")
+        c = _re.sub(r"[^a-z\s]", "", a.lower()).strip()
+        return _re.sub(r"\s+", " ", c)
+
+    # Discover all completed events this season
+    season_events = get_season_events(since_date_str="2025-10-01")
+    if not season_events:
+        print("[pipeline] backfill_season: no season events found")
+        return
+
+    # Which events are already done?
+    with queries.get_connection(db_path) as conn:
+        done_ids = queries.get_tournament_result_event_ids(conn)
+
+    # Get current season stats once — build a norm-name lookup
+    try:
+        stats_list = get_stats()
+    except Exception as exc:
+        print(f"[pipeline] backfill_season: stats fetch failed: {exc}")
+        stats_list = []
+
+    stats_lookup: dict = {}
+    for s in stats_list:
+        norm = _norm(s.get("player_name", ""))
+        if norm:
+            stats_lookup[norm] = s
+
+    now_iso = _dt.utcnow().isoformat()
+    events_processed = 0
+
+    for event in season_events:
+        event_id = event["event_id"]
+
+        # Skip current in-progress event and already-done events
+        if event_id == current_event_id or event_id in done_ids:
+            continue
+
+        competitors = event.get("competitors") or []
+        if not competitors:
+            continue
+
+        # Build player dicts for model scoring
+        players = []
+        for c in competitors:
+            player_name = c.get("player_name", "")
+            norm = _norm(player_name)
+            stat = stats_lookup.get(norm, {})
+
+            players.append({
+                "dg_id": c.get("dg_id"),
+                "player_name": player_name,
+                # ESPN stats — may be None if player not in current stats
+                "scoring_avg": stat.get("scoring_avg"),
+                "gir_pct": stat.get("gir_pct"),
+                "birdies_per_round": stat.get("birdies_per_round"),
+                "putts_per_hole": stat.get("putts_per_hole"),
+                "driving_dist": stat.get("driving_dist"),
+                # No form/fit for retroactive — set to None
+                "recent_form_sg": None,
+                "course_history_sg": None,
+                "finish_position": c.get("finish_position"),
+            })
+
+        if not players:
+            continue
+
+        # Run model scoring
+        try:
+            scored = model.sg_to_win_probs(players)
+        except Exception as exc:
+            print(f"[pipeline] backfill_season: scoring failed for {event_id}: {exc}")
+            continue
+
+        # Sort by win prob descending and assign model_rank
+        scored.sort(key=lambda p: p.get("dg_win_prob") or 0.0, reverse=True)
+        for rank, p in enumerate(scored, start=1):
+            p["model_rank"] = rank
+            p["is_pick"] = 1 if rank <= 20 else 0
+
+        # Build rows for tournament_results
+        tr_rows = []
+        for p in scored:
+            tr_rows.append({
+                "event_id": event_id,
+                "event_name": event["event_name"],
+                "week_label": event.get("start_date", ""),
+                "player_name": p.get("player_name"),
+                "dg_id": p.get("dg_id"),
+                "model_win_prob": p.get("dg_win_prob"),
+                "model_rank": p.get("model_rank"),
+                "finish_position": p.get("finish_position"),
+                "is_pick": p.get("is_pick", 0),
+                "recorded_at": now_iso,
+            })
+
+        # Top-20 picks for weekly_results
+        retro_picks = [p for p in scored if p.get("is_pick")]
+
+        with queries.get_connection(db_path) as conn:
+            queries.save_tournament_results(conn, tr_rows)
+            queries.snapshot_retro_picks(
+                conn,
+                event_id=event_id,
+                event_name=event["event_name"],
+                week_label=event.get("start_date", ""),
+                picks=[{
+                    "player_name": p.get("player_name"),
+                    "dg_id": p.get("dg_id"),
+                    "model_win_prob": p.get("dg_win_prob"),
+                    "finish_position": p.get("finish_position"),
+                } for p in retro_picks],
+                recorded_at=now_iso,
+            )
+            conn.commit()
+
+        events_processed += 1
+        print(f"[pipeline] backfill_season: processed {event['event_name']} ({event_id}): "
+              f"{len(tr_rows)} players, {len(retro_picks)} picks")
+
+    print(f"[pipeline] backfill_season: done — {events_processed} new events processed")
 
 
 def get_dashboard_data(db_path: str) -> dict:

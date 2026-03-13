@@ -9,6 +9,8 @@
 let ALL_PLAYERS = [];
 let CURRENT_FILTER = 'all';
 let HISTORY_LOADED = false;
+let LEADERBOARD_LOADED = false;
+const TOURNAMENT_DETAIL_CACHE = {}; // event_id → fetched rows
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -547,34 +549,23 @@ async function loadHistory() {
           </tr>`;
       }).join('');
 
+      // Get event_id from first row
+      const eventId = g.rows[0] ? (g.rows[0].event_id || '') : '';
+
       return `
         <div class="accordion-item" id="${panelId}">
           <h2 class="accordion-header">
             <button class="accordion-button collapsed py-2" type="button"
-                    data-bs-toggle="collapse" data-bs-target="#${collapseId}">
+                    data-bs-toggle="collapse" data-bs-target="#${collapseId}"
+                    onclick="loadTournamentDetail('${escHtml(eventId)}', '${collapseId}')">
               <span class="fw-semibold me-2">${escHtml(g.event_name || 'Tournament')}</span>
               <span class="text-muted small me-2">${escHtml(g.week_label || '')}</span>
               <span class="text-muted small fst-italic">${escHtml(summary)}</span>
             </button>
           </h2>
           <div id="${collapseId}" class="accordion-collapse collapse">
-            <div class="accordion-body p-0">
-              <div class="table-responsive">
-                <table class="table table-sm table-hover mb-0">
-                  <thead>
-                    <tr>
-                      <th>Player</th>
-                      <th>Pick Type</th>
-                      <th>Model Top10%</th>
-                      <th>Market Top10%</th>
-                      <th>Edge</th>
-                      <th>Finish</th>
-                      <th>Outcome</th>
-                    </tr>
-                  </thead>
-                  <tbody>${tableRows}</tbody>
-                </table>
-              </div>
+            <div class="accordion-body p-2" id="${collapseId}-body">
+              <div class="text-muted small fst-italic p-2">Loading tournament detail…</div>
             </div>
           </div>
         </div>`;
@@ -587,6 +578,195 @@ async function loadHistory() {
 
   } catch (err) {
     accordion.innerHTML = `<div class="text-danger small">Failed to load history: ${err.message}</div>`;
+  }
+}
+
+// ── Tournament detail (per-event full field) ──────────────────────────────────
+async function loadTournamentDetail(eventId, collapseId) {
+  const bodyEl = document.getElementById(`${collapseId}-body`);
+  if (!bodyEl) return;
+
+  // Don't re-fetch if already loaded
+  if (TOURNAMENT_DETAIL_CACHE[eventId]) {
+    renderTournamentDetail(bodyEl, TOURNAMENT_DETAIL_CACHE[eventId]);
+    return;
+  }
+
+  if (!eventId) {
+    bodyEl.innerHTML = '<div class="text-muted small p-2">No detail available.</div>';
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/tournament/${encodeURIComponent(eventId)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const rows = await res.json();
+    TOURNAMENT_DETAIL_CACHE[eventId] = rows;
+    renderTournamentDetail(bodyEl, rows);
+  } catch (err) {
+    bodyEl.innerHTML = `<div class="text-danger small p-2">Failed to load detail: ${err.message}</div>`;
+  }
+}
+
+function renderTournamentDetail(container, rows) {
+  if (!rows || rows.length === 0) {
+    container.innerHTML = '<div class="text-muted small p-2">No data available for this tournament.</div>';
+    return;
+  }
+
+  const picks = rows.filter(r => r.is_pick === 1);
+  const fullField = rows; // all rows, sorted by model_rank from API
+
+  function outcomeCell(r) {
+    if (r.finish_position == null) return '<span class="badge bg-secondary">Pending</span>';
+    if (r.finish_position <= 10) return '<span class="badge bg-success">&#10003; Hit</span>';
+    return '<span class="badge bg-danger">&#10007; Miss</span>';
+  }
+
+  function rankDeltaCell(r) {
+    if (r.finish_position == null || r.model_rank == null) return '<span class="text-muted">—</span>';
+    const delta = r.model_rank - r.finish_position;
+    if (delta > 0) return `<span class="text-success">+${delta}</span>`;
+    if (delta < 0) return `<span class="text-danger">${delta}</span>`;
+    return '<span class="text-secondary">0</span>';
+  }
+
+  function buildTable(tableRows) {
+    const trs = tableRows.map(r => `
+      <tr>
+        <td class="fw-semibold">${escHtml(r.player_name || '—')}</td>
+        <td class="text-center font-monospace small">#${r.model_rank || '—'}</td>
+        <td>${formatProb(r.model_win_prob)}</td>
+        <td class="text-center font-monospace">${r.finish_position != null ? '#' + r.finish_position : '—'}</td>
+        <td class="text-center">${rankDeltaCell(r)}</td>
+        <td>${outcomeCell(r)}</td>
+      </tr>`).join('');
+
+    return `
+      <div class="table-responsive">
+        <table class="table table-sm table-hover mb-0">
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th class="text-center" title="Model's win probability rank">Model Rank</th>
+              <th>Model Win%</th>
+              <th class="text-center">Finish</th>
+              <th class="text-center" title="Model rank minus finish position (positive = finished better than predicted)">Rank Delta</th>
+              <th>Outcome</th>
+            </tr>
+          </thead>
+          <tbody>${trs}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // Picks section
+  const picksHtml = picks.length > 0
+    ? `<div class="mb-3">
+         <div class="fw-semibold small mb-1 text-muted text-uppercase" style="letter-spacing:.05em">Model Picks (Top 20)</div>
+         ${buildTable(picks)}
+       </div>`
+    : '';
+
+  // Full field (collapsed)
+  const fullFieldId = `ff-${Math.random().toString(36).slice(2)}`;
+  const fullFieldHtml = `
+    <div>
+      <button class="btn btn-sm btn-outline-secondary mb-2" type="button"
+              onclick="
+                var el=document.getElementById('${fullFieldId}');
+                var btn=this;
+                if(el.style.display==='none'){el.style.display='';btn.textContent='Hide full field ▲';}
+                else{el.style.display='none';btn.textContent='Show full field ▶';}
+              ">
+        Show full field ▶
+      </button>
+      <div id="${fullFieldId}" style="display:none">
+        ${buildTable(fullField)}
+      </div>
+    </div>`;
+
+  container.innerHTML = picksHtml + fullFieldHtml;
+}
+
+// ── Player Leaderboard ────────────────────────────────────────────────────────
+async function loadLeaderboard() {
+  if (LEADERBOARD_LOADED) return;
+
+  const container = document.getElementById('leaderboardContainer');
+  const placeholder = document.getElementById('leaderboardPlaceholder');
+
+  try {
+    const res = await fetch('/api/leaderboard');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const rows = await res.json();
+
+    if (placeholder) placeholder.remove();
+
+    if (!rows || rows.length === 0) {
+      container.innerHTML = '<div class="text-muted small">No leaderboard data yet — run a refresh to populate.</div>';
+      LEADERBOARD_LOADED = true;
+      return;
+    }
+
+    const tableRows = rows.map(r => {
+      const hitRateDisplay = r.hit_rate != null
+        ? `<span class="${r.hit_rate >= 30 ? 'text-success' : 'text-danger'}">${r.hit_rate}%</span>`
+        : '<span class="text-muted">—</span>';
+
+      let rdDisplay = '<span class="text-muted">—</span>';
+      if (r.rank_delta != null) {
+        const cls = r.rank_delta > 5 ? 'text-success fw-bold'
+                  : r.rank_delta > 0 ? 'text-success'
+                  : r.rank_delta < -5 ? 'text-danger fw-bold'
+                  : r.rank_delta < 0 ? 'text-danger'
+                  : 'text-secondary';
+        const sign = r.rank_delta > 0 ? '+' : '';
+        rdDisplay = `<span class="${cls}" title="Avg model rank minus avg finish — positive means finished better than model predicted">${sign}${r.rank_delta}</span>`;
+      }
+
+      return `
+        <tr>
+          <td class="fw-semibold">${escHtml(r.player_name || '—')}</td>
+          <td class="text-center">${r.tournaments || 0}</td>
+          <td class="text-center">${r.picks || 0}</td>
+          <td class="text-center">${r.hits || 0}</td>
+          <td class="text-center">${hitRateDisplay}</td>
+          <td class="text-center font-monospace small">${r.avg_model_rank != null ? r.avg_model_rank : '—'}</td>
+          <td class="text-center font-monospace small">${r.avg_finish_rank != null ? r.avg_finish_rank : '—'}</td>
+          <td class="text-center">${rdDisplay}</td>
+        </tr>`;
+    }).join('');
+
+    container.innerHTML = `
+      <div class="table-responsive-wrapper">
+        <div class="table-responsive">
+          <table class="table table-sm table-hover align-middle" style="font-size:0.85rem">
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th class="text-center" title="Tournaments tracked">Events</th>
+                <th class="text-center" title="Times in model top-20">Picks</th>
+                <th class="text-center" title="Times picked and finished top-10">Hits</th>
+                <th class="text-center" title="Hit rate (hits / picks)">Hit Rate</th>
+                <th class="text-center" title="Average model win probability rank">Avg Model Rank</th>
+                <th class="text-center" title="Average actual finish position">Avg Finish</th>
+                <th class="text-center" title="Avg model rank minus avg finish. Positive = finished better than predicted.">Rank Delta</th>
+              </tr>
+            </thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="text-muted small mt-2 fst-italic">
+        Rank Delta: model rank minus finish position — positive means the player finished better than the model predicted.
+        Based on retroactive model runs using current season stats.
+      </div>`;
+
+    LEADERBOARD_LOADED = true;
+
+  } catch (err) {
+    container.innerHTML = `<div class="text-danger small">Failed to load leaderboard: ${err.message}</div>`;
   }
 }
 

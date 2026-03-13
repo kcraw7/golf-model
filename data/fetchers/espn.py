@@ -518,6 +518,140 @@ def get_last_year_top_finishers(event_name: str, start_date_str: str, top_n: int
         return []
 
 
+# ── All completed PGA Tour events since a start date ─────────────────────────
+
+def get_season_events(since_date_str: str = "2025-10-01") -> list:
+    """Return all completed PGA Tour events since since_date_str.
+
+    Uses a single date-range query (YYYYMMDD-YYYYMMDD) which is the only
+    reliable way to get historical events from the ESPN scoreboard API.
+
+    Returns:
+        [
+            {
+                "event_id":    "espn_401811935",  # prefixed with espn_
+                "event_name":  "The Masters",
+                "start_date":  "2026-04-09",
+                "competitors": [
+                    {"player_name": "Rory McIlroy", "dg_id": 123, "finish_position": 1},
+                    ...
+                ]
+            },
+            ...
+        ]
+    Deduplicates by event_id. Returns [] on failure. Never raises.
+    Excludes: canceled events, events with < 50 competitors (Hero World Challenge
+    type invitationals), and events with "Q-School" or "Korn Ferry" in the name.
+    """
+    try:
+        from datetime import datetime as _dt
+
+        try:
+            start_dt = _dt.strptime(since_date_str[:10], "%Y-%m-%d").date()
+        except Exception:
+            print(f"[espn] get_season_events: bad since_date: {since_date_str}")
+            return []
+
+        today = date.today()
+        start_str = start_dt.strftime("%Y%m%d")
+        end_str = today.strftime("%Y%m%d")
+        date_range = f"{start_str}-{end_str}"
+
+        try:
+            resp = requests.get(
+                _SCOREBOARD_URL,
+                params={"dates": date_range},
+                timeout=_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            print(f"[espn] get_season_events: fetch failed for range {date_range}: {exc}")
+            return []
+
+        seen_event_ids: set = set()
+        results: list = []
+
+        # Non-PGA-Tour events to skip by name keyword
+        _SKIP_KEYWORDS = ("q-school", "korn ferry", "hero world", "challenge cup")
+
+        for event in data.get("events") or []:
+            raw_id = str(event.get("id") or "")
+            if not raw_id or raw_id in seen_event_ids:
+                continue
+
+            # Only completed events
+            status_name = (
+                event.get("status", {}).get("type", {}).get("name", "")
+            )
+            if status_name != "STATUS_FINAL":
+                continue
+
+            event_name = event.get("name") or event.get("shortName") or ""
+
+            # Skip non-PGA-Tour events by name
+            name_lower = event_name.lower()
+            if any(kw in name_lower for kw in _SKIP_KEYWORDS):
+                print(f"[espn] get_season_events: skipping '{event_name}' (name filter)")
+                continue
+
+            competitors_raw = (
+                event.get("competitions") or [{}]
+            )[0].get("competitors") or []
+
+            # Skip small-field invitationals (Hero World Challenge = 20 players)
+            if len(competitors_raw) < 50:
+                print(f"[espn] get_season_events: skipping '{event_name}' (<50 players)")
+                continue
+
+            seen_event_ids.add(raw_id)
+            raw_start = event.get("date") or ""
+            start_date = _safe_date(raw_start)
+
+            competitors = []
+            for c in competitors_raw:
+                athlete = c.get("athlete") or {}
+                player_name = (
+                    athlete.get("displayName")
+                    or athlete.get("fullName")
+                    or ""
+                )
+                if not player_name:
+                    continue
+
+                raw_pid = c.get("id") or ""
+                try:
+                    dg_id = int(raw_pid)
+                except (TypeError, ValueError):
+                    dg_id = None
+
+                finish = c.get("order")
+                try:
+                    finish_int = int(finish) if finish is not None else None
+                except (TypeError, ValueError):
+                    finish_int = None
+
+                competitors.append({
+                    "player_name": player_name,
+                    "dg_id": dg_id,
+                    "finish_position": finish_int,
+                })
+
+            results.append({
+                "event_id": f"espn_{raw_id}",
+                "event_name": event_name,
+                "start_date": start_date,
+                "competitors": competitors,
+            })
+
+        print(f"[espn] get_season_events: found {len(results)} completed events since {since_date_str}")
+        return results
+
+    except Exception as exc:
+        print(f"[espn] get_season_events: unexpected error: {exc}")
+        return []
+
+
 # ── Finish positions for a completed past event ───────────────────────────────
 
 def get_event_results(espn_event_id: str, week_label_str: str) -> dict:

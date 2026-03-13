@@ -84,6 +84,22 @@ def init_db(db_path: str) -> None:
             warnings              TEXT,
             odds_credits_remaining INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS tournament_results (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id        TEXT NOT NULL,
+            event_name      TEXT,
+            week_label      TEXT,
+            player_name     TEXT,
+            dg_id           INTEGER,
+            model_win_prob  REAL,
+            model_rank      INTEGER,
+            finish_position INTEGER,
+            is_pick         INTEGER DEFAULT 0,
+            recorded_at     TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_tr_event_player
+            ON tournament_results(event_id, player_name);
     """)
 
     conn.commit()

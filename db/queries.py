@@ -90,6 +90,107 @@ def update_player_outcome(
     """, (finish_position, outcome_hit, row_id))
 
 
+# ── tournament_results queries ────────────────────────────────────────────────
+
+def get_tournament_result_event_ids(conn: sqlite3.Connection) -> set:
+    """Return set of event_ids already in tournament_results."""
+    cur = conn.execute("SELECT DISTINCT event_id FROM tournament_results")
+    return {r[0] for r in cur.fetchall()}
+
+
+def save_tournament_results(conn: sqlite3.Connection, rows: list) -> None:
+    """INSERT OR IGNORE full-field rows into tournament_results."""
+    for row in rows:
+        conn.execute("""
+            INSERT OR IGNORE INTO tournament_results
+                (event_id, event_name, week_label, player_name, dg_id,
+                 model_win_prob, model_rank, finish_position, is_pick, recorded_at)
+            VALUES
+                (:event_id, :event_name, :week_label, :player_name, :dg_id,
+                 :model_win_prob, :model_rank, :finish_position, :is_pick, :recorded_at)
+        """, row)
+
+
+def snapshot_retro_picks(
+    conn: sqlite3.Connection,
+    event_id: str,
+    event_name: str,
+    week_label: str,
+    picks: list,
+    recorded_at: str,
+) -> None:
+    """Insert retroactive top-20 picks into weekly_results with recommendation='Model Pick'.
+    Skips duplicates by (event_id, dg_id).
+    picks: list of dicts with player_name, dg_id, model_win_prob
+    """
+    existing = conn.execute(
+        "SELECT dg_id FROM weekly_results WHERE event_id = ?", (event_id,)
+    ).fetchall()
+    existing_ids = {r["dg_id"] for r in existing}
+
+    for p in picks:
+        if p.get("dg_id") in existing_ids:
+            continue
+        conn.execute("""
+            INSERT INTO weekly_results
+                (event_id, event_name, week_label, dg_id, player_name,
+                 finish_position, recommendation, model_prob, market_prob,
+                 edge, outcome_hit, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'Model Pick', ?, NULL, NULL, ?, ?)
+        """, (
+            event_id,
+            event_name,
+            week_label,
+            p.get("dg_id"),
+            p.get("player_name"),
+            p.get("finish_position"),
+            p.get("model_win_prob"),
+            1 if (p.get("finish_position") or 999) <= 10 else 0,
+            recorded_at,
+        ))
+
+
+def get_tournament_detail(conn: sqlite3.Connection, event_id: str) -> list:
+    """Return all rows for one event from tournament_results, ordered by model_rank ASC."""
+    cur = conn.execute("""
+        SELECT * FROM tournament_results
+        WHERE event_id = ?
+        ORDER BY model_rank ASC
+    """, (event_id,))
+    return _rows_to_list(cur.fetchall())
+
+
+def get_player_leaderboard(conn: sqlite3.Connection) -> list:
+    """Aggregate per player across tournament_results.
+    Returns: player_name, tournaments, picks, hits, hit_rate,
+             avg_model_rank, avg_finish_rank, rank_delta
+    """
+    cur = conn.execute("""
+        SELECT
+            player_name,
+            COUNT(DISTINCT event_id)                                AS tournaments,
+            SUM(CASE WHEN is_pick = 1 THEN 1 ELSE 0 END)           AS picks,
+            SUM(CASE WHEN is_pick = 1 AND finish_position <= 10
+                     THEN 1 ELSE 0 END)                             AS hits,
+            CASE WHEN SUM(is_pick) > 0
+                 THEN ROUND(
+                     100.0 * SUM(CASE WHEN is_pick = 1 AND finish_position <= 10
+                                      THEN 1 ELSE 0 END)
+                     / SUM(is_pick), 1)
+                 ELSE NULL END                                       AS hit_rate,
+            ROUND(AVG(CAST(model_rank AS REAL)), 1)                 AS avg_model_rank,
+            ROUND(AVG(CAST(finish_position AS REAL)), 1)            AS avg_finish_rank,
+            ROUND(AVG(CAST(model_rank AS REAL))
+                - AVG(CAST(finish_position AS REAL)), 1)            AS rank_delta
+        FROM tournament_results
+        WHERE finish_position IS NOT NULL
+        GROUP BY player_name
+        HAVING tournaments >= 1
+        ORDER BY picks DESC, hit_rate DESC
+    """)
+    return _rows_to_list(cur.fetchall())
+
+
 # ── Write queries ────────────────────────────────────────────────────────────
 
 def replace_tournament(conn: sqlite3.Connection, data: dict) -> None:

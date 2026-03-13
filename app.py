@@ -44,5 +44,29 @@ def api_history():
     return jsonify(history)
 
 
+@app.route("/api/tournament/<event_id>")
+def api_tournament_detail(event_id):
+    with queries.get_connection(config.DATABASE_PATH) as conn:
+        rows = queries.get_tournament_detail(conn, event_id)
+    return jsonify(rows)
+
+
+@app.route("/api/leaderboard")
+def api_leaderboard():
+    with queries.get_connection(config.DATABASE_PATH) as conn:
+        rows = queries.get_player_leaderboard(conn)
+    return jsonify(rows)
+
+
+@app.route("/api/backfill_season", methods=["POST"])
+def api_backfill_season():
+    """Manually trigger season backfill — useful for seeding a fresh Render DB."""
+    try:
+        pipeline.backfill_season(config.DATABASE_PATH)
+        return jsonify({"status": "ok"})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True)
