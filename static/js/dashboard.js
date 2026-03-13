@@ -10,11 +10,14 @@ let ALL_PLAYERS = [];
 let CURRENT_FILTER = 'all';
 let HISTORY_LOADED = false;
 let LEADERBOARD_LOADED = false;
+let LEADERBOARD_DATA = [];
 const TOURNAMENT_DETAIL_CACHE = {}; // event_id → fetched rows
+let PLAYER_SORT = { key: 'edge_top10', asc: false }; // key + direction for main table
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   fetchData();
+  initPlayerTableSort();
 });
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
@@ -148,7 +151,12 @@ function weatherEmoji(desc) {
 // ── Player table ──────────────────────────────────────────────────────────────
 function applyFilters() {
   const search = (document.getElementById('searchInput').value || '').toLowerCase().trim();
-  const sort = document.getElementById('sortSelect').value;
+  // Sync PLAYER_SORT.key from dropdown when dropdown changes (not header click)
+  const sel = document.getElementById('sortSelect');
+  if (sel && sel.value && sel.value !== PLAYER_SORT.key) {
+    PLAYER_SORT.key = sel.value;
+    PLAYER_SORT.asc = false; // default desc for dropdown changes
+  }
   const filter = CURRENT_FILTER;
 
   let players = [...ALL_PLAYERS];
@@ -163,24 +171,50 @@ function applyFilters() {
     players = players.filter(p => (p.player_name || '').toLowerCase().includes(search));
   }
 
-  // Sort
+  // Sort using PLAYER_SORT state (set by header clicks or dropdown)
+  const sk = PLAYER_SORT.key;
+  const sasc = PLAYER_SORT.asc;
   players.sort((a, b) => {
-    if (sort === 'player_name') {
-      return (a.player_name || '').localeCompare(b.player_name || '');
-    }
-    if (sort === 'edge_top10') {
-      return sortNullsLast(b.edge_top10, a.edge_top10);
-    }
-    if (sort === 'dg_win_prob') {
-      return sortNullsLast(b.dg_win_prob, a.dg_win_prob);
-    }
-    if (sort === 'sg_total') {
-      return sortNullsLast(b.sg_total, a.sg_total);
-    }
-    return 0;
+    const va = a[sk], vb = b[sk];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    const isNum = typeof va === 'number' || typeof vb === 'number';
+    const cmp = isNum ? va - vb : String(va).localeCompare(String(vb));
+    return sasc ? cmp : -cmp;
   });
 
   renderPlayers(players);
+  updatePlayerSortIndicators();
+}
+
+function initPlayerTableSort() {
+  document.querySelectorAll('#playerTable thead th[data-sort-key]').forEach(th => {
+    th.classList.add('sortable');
+    th.addEventListener('click', () => {
+      const key = th.dataset.sortKey;
+      const preferDesc = 'sortDesc' in th.dataset; // numeric stats default to desc first
+      if (PLAYER_SORT.key === key) {
+        PLAYER_SORT.asc = !PLAYER_SORT.asc;
+      } else {
+        PLAYER_SORT.key = key;
+        PLAYER_SORT.asc = !preferDesc;
+      }
+      // Keep dropdown in sync so it doesn't look stale
+      const sel = document.getElementById('sortSelect');
+      if (sel && [...sel.options].some(o => o.value === key)) sel.value = key;
+      applyFilters();
+    });
+  });
+}
+
+function updatePlayerSortIndicators() {
+  document.querySelectorAll('#playerTable thead th').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sortKey === PLAYER_SORT.key) {
+      th.classList.add(PLAYER_SORT.asc ? 'sort-asc' : 'sort-desc');
+    }
+  });
 }
 
 function sortNullsLast(a, b) {
@@ -557,15 +591,15 @@ async function loadHistory() {
           <h2 class="accordion-header">
             <button class="accordion-button collapsed py-2" type="button"
                     data-bs-toggle="collapse" data-bs-target="#${collapseId}"
-                    onclick="loadTournamentDetail('${escHtml(eventId)}', '${collapseId}')">
+                    aria-expanded="false" aria-controls="${collapseId}">
               <span class="fw-semibold me-2">${escHtml(g.event_name || 'Tournament')}</span>
               <span class="text-muted small me-2">${escHtml(g.week_label || '')}</span>
               <span class="text-muted small fst-italic">${escHtml(summary)}</span>
             </button>
           </h2>
-          <div id="${collapseId}" class="accordion-collapse collapse">
+          <div id="${collapseId}" class="accordion-collapse collapse" data-event-id="${escHtml(eventId)}">
             <div class="accordion-body p-2" id="${collapseId}-body">
-              <div class="text-muted small fst-italic p-2">Loading tournament detail…</div>
+              <div class="text-muted small fst-italic p-2">Click to load tournament detail…</div>
             </div>
           </div>
         </div>`;
@@ -574,11 +608,67 @@ async function loadHistory() {
     // Insert stats bar before accordion
     accordion.insertAdjacentHTML('beforebegin', statsHtml);
     accordion.innerHTML = panels;
+
+    // Load tournament detail lazily on expand — use show.bs.collapse on the document
+    // (direct element listeners have timing issues with Bootstrap removing .collapsed)
+    function onCollapseShow(e) {
+      const colEl = e.target;
+      if (!colEl.closest('#historyAccordion')) return;
+      const eid = colEl.dataset.eventId;
+      if (eid) loadTournamentDetail(eid, colEl.id);
+    }
+    // Remove any previous listener to avoid duplicates if loadHistory re-runs
+    document.removeEventListener('show.bs.collapse', onCollapseShow);
+    document.addEventListener('show.bs.collapse', onCollapseShow);
+
     HISTORY_LOADED = true;
 
   } catch (err) {
     accordion.innerHTML = `<div class="text-danger small">Failed to load history: ${err.message}</div>`;
   }
+}
+
+// ── Generic sortable table helper ─────────────────────────────────────────────
+/**
+ * Attach click-to-sort to a rendered table.
+ * @param {HTMLElement} tableEl   - the <table> element
+ * @param {Function}    getRows   - () => current data array
+ * @param {Function}    renderRow - (row) => <tr> HTML string
+ * @param {Array}       colDefs   - [{key, numeric, defaultDesc}|null] per <th> index
+ */
+function makeSortable(tableEl, getRows, renderRow, colDefs) {
+  const theadRow = tableEl.querySelector('thead tr');
+  const tbody = tableEl.querySelector('tbody');
+  if (!theadRow || !tbody) return;
+
+  let sortKey = null;
+  let sortAsc = true;
+
+  theadRow.querySelectorAll('th').forEach((th, i) => {
+    const def = colDefs[i];
+    if (!def) return;
+    th.classList.add('sortable');
+    th.addEventListener('click', () => {
+      if (sortKey === def.key) {
+        sortAsc = !sortAsc;
+      } else {
+        sortKey = def.key;
+        sortAsc = !def.defaultDesc;
+      }
+      theadRow.querySelectorAll('th').forEach(t => t.classList.remove('sort-asc', 'sort-desc'));
+      th.classList.add(sortAsc ? 'sort-asc' : 'sort-desc');
+
+      const sorted = [...getRows()].sort((a, b) => {
+        const va = a[def.key], vb = b[def.key];
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        const cmp = def.numeric ? va - vb : String(va).localeCompare(String(vb));
+        return sortAsc ? cmp : -cmp;
+      });
+      tbody.innerHTML = sorted.map(renderRow).join('');
+    });
+  });
 }
 
 // ── Tournament detail (per-event full field) ──────────────────────────────────
@@ -631,17 +721,19 @@ function renderTournamentDetail(container, rows) {
     return '<span class="text-secondary">0</span>';
   }
 
-  function buildTable(tableRows) {
-    const trs = tableRows.map(r => `
+  function buildDetailRow(r) {
+    return `
       <tr>
         <td class="fw-semibold">${escHtml(r.player_name || '—')}</td>
-        <td class="text-center font-monospace small">#${r.model_rank || '—'}</td>
+        <td class="text-center font-monospace small">${r.model_rank != null ? '#' + r.model_rank : '—'}</td>
         <td>${formatProb(r.model_win_prob)}</td>
         <td class="text-center font-monospace">${r.finish_position != null ? '#' + r.finish_position : '—'}</td>
         <td class="text-center">${rankDeltaCell(r)}</td>
         <td>${outcomeCell(r)}</td>
-      </tr>`).join('');
+      </tr>`;
+  }
 
+  function buildTableHtml(tableRows) {
     return `
       <div class="table-responsive">
         <table class="table table-sm table-hover mb-0">
@@ -651,25 +743,34 @@ function renderTournamentDetail(container, rows) {
               <th class="text-center" title="Model's win probability rank">Model Rank</th>
               <th>Model Win%</th>
               <th class="text-center">Finish</th>
-              <th class="text-center" title="Model rank minus finish position (positive = finished better than predicted)">Rank Delta</th>
+              <th class="text-center" title="Model rank minus finish (positive = finished better than predicted)">Rank Delta</th>
               <th>Outcome</th>
             </tr>
           </thead>
-          <tbody>${trs}</tbody>
+          <tbody>${tableRows.map(buildDetailRow).join('')}</tbody>
         </table>
       </div>`;
   }
 
-  // Picks section
+  // Column defs for makeSortable — matches headers above
+  const DETAIL_COLS = [
+    { key: 'player_name',    numeric: false, defaultDesc: false },
+    { key: 'model_rank',     numeric: true,  defaultDesc: false },
+    { key: 'model_win_prob', numeric: true,  defaultDesc: true  },
+    { key: 'finish_position',numeric: true,  defaultDesc: false },
+    null, // rank delta — derived, skip
+    null, // outcome badge — skip
+  ];
+
+  const fullFieldId = `ff-${Math.random().toString(36).slice(2)}`;
+
   const picksHtml = picks.length > 0
     ? `<div class="mb-3">
          <div class="fw-semibold small mb-1 text-muted text-uppercase" style="letter-spacing:.05em">Model Picks (Top 20)</div>
-         ${buildTable(picks)}
+         ${buildTableHtml(picks)}
        </div>`
     : '';
 
-  // Full field (collapsed)
-  const fullFieldId = `ff-${Math.random().toString(36).slice(2)}`;
   const fullFieldHtml = `
     <div>
       <button class="btn btn-sm btn-outline-secondary mb-2" type="button"
@@ -682,11 +783,24 @@ function renderTournamentDetail(container, rows) {
         Show full field ▶
       </button>
       <div id="${fullFieldId}" style="display:none">
-        ${buildTable(fullField)}
+        ${buildTableHtml(fullField)}
       </div>
     </div>`;
 
   container.innerHTML = picksHtml + fullFieldHtml;
+
+  // Attach sort to picks table (first table in container)
+  const tables = container.querySelectorAll('table');
+  let picksData = [...picks];
+  let ffData = [...fullField];
+
+  if (tables[0] && picks.length > 0) {
+    makeSortable(tables[0], () => picksData, buildDetailRow, DETAIL_COLS);
+  }
+  const ffTableIdx = picks.length > 0 ? 1 : 0;
+  if (tables[ffTableIdx]) {
+    makeSortable(tables[ffTableIdx], () => ffData, buildDetailRow, DETAIL_COLS);
+  }
 }
 
 // ── Player Leaderboard ────────────────────────────────────────────────────────
@@ -709,7 +823,9 @@ async function loadLeaderboard() {
       return;
     }
 
-    const tableRows = rows.map(r => {
+    LEADERBOARD_DATA = rows;
+
+    function renderLbRow(r) {
       const hitRateDisplay = r.hit_rate != null
         ? `<span class="${r.hit_rate >= 30 ? 'text-success' : 'text-danger'}">${r.hit_rate}%</span>`
         : '<span class="text-muted">—</span>';
@@ -722,7 +838,7 @@ async function loadLeaderboard() {
                   : r.rank_delta < 0 ? 'text-danger'
                   : 'text-secondary';
         const sign = r.rank_delta > 0 ? '+' : '';
-        rdDisplay = `<span class="${cls}" title="Avg model rank minus avg finish — positive means finished better than model predicted">${sign}${r.rank_delta}</span>`;
+        rdDisplay = `<span class="${cls}">${sign}${r.rank_delta}</span>`;
       }
 
       return `
@@ -736,25 +852,25 @@ async function loadLeaderboard() {
           <td class="text-center font-monospace small">${r.avg_finish_rank != null ? r.avg_finish_rank : '—'}</td>
           <td class="text-center">${rdDisplay}</td>
         </tr>`;
-    }).join('');
+    }
 
     container.innerHTML = `
       <div class="table-responsive-wrapper">
         <div class="table-responsive">
-          <table class="table table-sm table-hover align-middle" style="font-size:0.85rem">
+          <table class="table table-sm table-hover align-middle" id="leaderboardTable" style="font-size:0.85rem">
             <thead>
               <tr>
-                <th>Player</th>
+                <th title="Player name">Player</th>
                 <th class="text-center" title="Tournaments tracked">Events</th>
                 <th class="text-center" title="Times in model top-20">Picks</th>
                 <th class="text-center" title="Times picked and finished top-10">Hits</th>
                 <th class="text-center" title="Hit rate (hits / picks)">Hit Rate</th>
                 <th class="text-center" title="Average model win probability rank">Avg Model Rank</th>
                 <th class="text-center" title="Average actual finish position">Avg Finish</th>
-                <th class="text-center" title="Avg model rank minus avg finish. Positive = finished better than predicted.">Rank Delta</th>
+                <th class="text-center" title="Avg model rank minus avg finish — positive = finished better than predicted">Rank Delta</th>
               </tr>
             </thead>
-            <tbody>${tableRows}</tbody>
+            <tbody>${rows.map(renderLbRow).join('')}</tbody>
           </table>
         </div>
       </div>
@@ -762,6 +878,20 @@ async function loadLeaderboard() {
         Rank Delta: model rank minus finish position — positive means the player finished better than the model predicted.
         Based on retroactive model runs using current season stats.
       </div>`;
+
+    // Attach sort to leaderboard table
+    const lbTable = container.querySelector('#leaderboardTable');
+    const LB_COLS = [
+      { key: 'player_name',    numeric: false, defaultDesc: false },
+      { key: 'tournaments',    numeric: true,  defaultDesc: true  },
+      { key: 'picks',          numeric: true,  defaultDesc: true  },
+      { key: 'hits',           numeric: true,  defaultDesc: true  },
+      { key: 'hit_rate',       numeric: true,  defaultDesc: true  },
+      { key: 'avg_model_rank', numeric: true,  defaultDesc: false },
+      { key: 'avg_finish_rank',numeric: true,  defaultDesc: false },
+      { key: 'rank_delta',     numeric: true,  defaultDesc: true  },
+    ];
+    if (lbTable) makeSortable(lbTable, () => LEADERBOARD_DATA, renderLbRow, LB_COLS);
 
     LEADERBOARD_LOADED = true;
 

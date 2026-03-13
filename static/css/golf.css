@@ -145,6 +145,25 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ── Sortable table headers ──────────────────────────────────────────────── */
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+th.sortable::after {
+  content: ' ⇅';
+  opacity: 0.25;
+  font-size: 0.7em;
+}
+th.sort-asc::after {
+  content: ' ▲';
+  opacity: 0.85;
+}
+th.sort-desc::after {
+  content: ' ▼';
+  opacity: 0.85;
+}
+
 /* ── Responsive tweaks ───────────────────────────────────────────────────── */
 @media (max-width: 576px) {
   .golf-table {
